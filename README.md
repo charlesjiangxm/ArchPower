@@ -1,7 +1,7 @@
 # ArchPower
-ArchPower: Dataset for Architecture-Level Power Modeling of Modern CPU Design
-
 **[New] 28nm dataset is available now**
+
+ArchPower: Dataset for Architecture-Level Power Modeling of Modern CPU Design
 
 Power is the primary design objective of large-scale integrated circuits (ICs), especially for complex modern processors (i.e., CPUs). Accurate CPU power evaluation requires designers to go through the whole time-consuming IC implementation process, easily taking months. At the early design stage (e.g., architecture-level), classical power models are notoriously inaccurate. Recently, ML-based architecture-level power models have been proposed to boost accuracy, but the data availability is a severe challenge. Currently, there is no open-source dataset for this important ML application. A typical dataset generation process involves correct CPU design implementation and repetitive execution of power simulation flows, requiring significant design expertise, engineering effort, and execution time. Even private in-house datasets often fail to reflect realistic CPU design scenarios. 
 
