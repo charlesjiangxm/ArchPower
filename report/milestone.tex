@@ -1,0 +1,259 @@
+% Project Milestone Report — CVPR 2022 Template
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+\usepackage[pagenumbers]{cvpr}
+
+\usepackage{hyperref}
+\usepackage{multirow}
+
+\def\paperID{N/A}
+\def\confName{CVPR}
+\def\confYear{2022}
+
+\title{Cross-Feature Attention for Architecture-Level CPU Power Modeling:\\An FT-Transformer Approach on the ArchPower Dataset}
+
+\author{Jingbo Jiang}
+
+\begin{document}
+\maketitle
+
+%% ====================================================================
+\begin{abstract}
+Accurate architecture-level power estimation is critical for early-stage
+CPU design-space exploration.  We propose using the Feature Tokenizer
+Transformer (FT-Transformer) for component-level CPU power prediction.
+FT-Transformer tokenizes each of 81 event features into a learned
+embedding and applies multi-head self-attention to model
+\emph{cross-feature interactions}---capturing how coupled
+microarchitectural activities jointly determine power.
+On the ArchPower dataset (200 samples, 2 RISC-V architectures),
+FT-Transformer achieves 3.61\%/5.33\% MAPE (BOOM/XiangShan), outperforming
+Ridge (4.36\%/5.95\%) and MLP (6.29\%/7.76\%) baselines.  While XGBoost
+currently edges ahead (2.36\%/4.26\%) due to its small-data advantage,
+we propose collecting an expanded dataset for the final report where we
+expect FT-Transformer to achieve the best accuracy.
+\end{abstract}
+
+%% ====================================================================
+\section{Introduction}
+
+Power consumption is the primary design constraint for modern processors.
+Accurate power evaluation traditionally requires the full RTL
+implementation, logic synthesis, and signoff-grade power analysis—a process
+that easily takes months and precludes rapid design-space exploration at
+the architecture level~\cite{zhang2025archpower}.  Classical analytical
+tools such as McPAT~\cite{li2009mcpat} attempt to fill this gap but are
+known to exhibit large modeling errors on modern out-of-order CPUs.
+
+Recent work has proposed \emph{ML-calibrated} analytical models.
+McPAT-Calib~\cite{zhai2021mcpat_calib} trains XGBoost regressors to correct
+McPAT's component-level estimates, while PANDA~\cite{zhang2023panda}
+introduces physics-aware \emph{resource functions} that encode
+hardware-dependent scaling prior to ML training.  Neural-network-based
+approaches have also been explored~\cite{zhai2023neural_power}, but
+existing methods treat input features independently—missing the rich
+\emph{cross-feature interactions} inherent in CPU power behavior.  For
+example, branch misprediction rates interact with instruction fetch
+bandwidth to determine front-end power, and cache miss rates couple with
+memory controller traffic to drive back-end power.  Models that capture
+these pairwise interactions should yield both better predictions and more
+interpretable insights.
+
+We propose applying the Feature Tokenizer Transformer
+(FT-Transformer)~\cite{gorishniy2021ft_transformer} to architecture-level
+power modeling.  FT-Transformer tokenizes each scalar feature into a
+learned embedding, then applies multi-head self-attention over all feature
+tokens.  This design is uniquely suited to power modeling because:
+(1)~each attention head learns a distinct interaction pattern (\eg,
+pipeline-stage coupling \vs memory-hierarchy coupling);
+(2)~the $81 \times 81$ attention matrices are directly interpretable as
+event-to-event interaction maps; and
+(3)~multi-target regression provides implicit regularization critical for
+the small-data regime.
+
+Our contributions at this milestone are:
+(1)~an \textbf{event-only preprocessing} pipeline that factors out
+hardware dependence via PANDA's resource functions (101$\to$81 features);
+(2)~demonstrating that \textbf{FT-Transformer outperforms} both Ridge and
+MLP baselines, validating cross-feature attention for power prediction; and
+(3)~a \textbf{data scaling hypothesis} arguing that XGBoost's current lead
+is an artifact of the limited dataset size.
+
+%% ====================================================================
+\section{Problem Statement}
+
+We use the ArchPower dataset~\cite{zhang2025archpower}, an open-source
+benchmark with 200 CPU data samples from two RISC-V architectures:
+\textbf{BOOM} (15 configs $\times$ 8 workloads = 120 samples) and
+\textbf{XiangShan} (10 configs $\times$ 8 workloads = 80 samples).
+Each sample has a 101-d feature vector (20 hardware parameters + 81 event
+parameters) and power labels for 12 components $\times$ 5 power groups.
+
+\noindent\textbf{Task.}  Given only the 81 event features (after removing
+hardware dependence), predict the 12-component power vector for unseen CPU
+configurations.  Splits are at the \emph{configuration level}---all 8
+workloads from a config are entirely in train or test---to evaluate
+cross-configuration generalization.
+
+\noindent\textbf{Evaluation.}  MAPE, $R^2$, and RMSE on a config-level
+holdout (20\% of configs).
+
+\noindent\textbf{Challenge.}  The extreme sample-to-feature ratio (120 or
+80 samples for 81 features) makes overfitting the dominant risk.
+
+%% ====================================================================
+\section{Technical Approach}
+
+\subsection{Data Preprocessing: Event-Only Dataset}
+\label{sec:preproc}
+Following PANDA~\cite{zhang2023panda}, we model each component's power as
+$P_c = R_c(\mathbf{x}_\text{hw}) \cdot f_c(\mathbf{x}_\text{event})$ and
+divide out the hardware-dependent resource function $R_c$ to obtain
+normalized labels $P'_c = P_c / R_c$.  Resource functions are
+\emph{multiplicative} for most components (BP, ICache, IFU, RNU, LSU,
+DCache, ROB), \emph{additive} for Regfile, \emph{lookup-table} for ISU,
+and \emph{identity} for FU-Pool.
+After normalization, the 20 hardware-constant columns are removed, yielding
+an 81-d event-only feature matrix used by all downstream models.
+
+\subsection{Proposed Model: FT-Transformer}
+
+The core of our approach is the Feature Tokenizer Transformer
+(FT-Transformer)~\cite{gorishniy2021ft_transformer}, designed specifically
+for tabular data.  Unlike MLPs that process the concatenated feature vector
+through dense layers, FT-Transformer \emph{tokenizes each feature
+independently}: every scalar event feature $x_j$ is projected into a
+$d$-dimensional embedding $\mathbf{t}_j = \mathbf{w}_j x_j +
+\mathbf{b}_j$.  A \texttt{[CLS]} token is appended, and the 82 tokens
+are processed by transformer blocks with multi-head self-attention.
+
+\noindent\textbf{Why attention captures cross-feature interactions.}
+Power consumption arises from complex interactions between
+microarchitectural activities---\eg, instruction cache misses increase
+fetch stalls, reducing issue-queue utilization and functional-unit power.
+Linear models ignore these interactions; MLPs learn them only implicitly.
+In contrast, each self-attention head computes an explicit
+$81\times 81$ interaction matrix
+$\mathbf{A} = \text{softmax}(\mathbf{Q}\mathbf{K}^\top / \sqrt{d_k})$,
+where $A_{ij}$ quantifies how strongly event $i$ attends to event $j$.
+Multiple heads capture distinct patterns simultaneously---pipeline-stage
+coupling, memory-hierarchy dependencies, etc.
+
+\noindent\textbf{Architecture and training.}
+We use $d_\text{token}{=}32$ (BOOM) or 48 (XS), 2 transformer blocks,
+4 attention heads, and FFN dimension 64 (22K--40K parameters).
+Training has two phases: (1)~\emph{self-supervised pre-training} via masked
+feature modeling, where random features are masked and reconstructed to
+learn feature correlations; (2)~\emph{supervised fine-tuning} with MSE loss
+on all 12 power components and early stopping.  After training, we extract
+attention weight matrices to construct event-to-event interaction maps.
+
+\subsection{Baseline Models}
+
+\noindent\textbf{Ridge Regression.}  Multi-output Ridge
+(81$\to$12, 984 params)---captures only first-order relationships.
+
+\noindent\textbf{3-Layer MLP.}  Hidden layers (128, 64, 32) with ReLU and
+L2 regularization (21K params)---learns nonlinear mappings but models
+interactions only implicitly.
+
+\noindent\textbf{XGBoost GBDT.}  Twelve independent regressors (100 trees,
+depth 6)---excels on small tabular data but lacks explicit cross-feature
+interaction modeling and interpretability.
+
+%% ====================================================================
+\section{Intermediate/Preliminary Results}
+
+\subsection{FT-Transformer Outperforms Ridge and MLP}
+
+Table~\ref{tab:results} summarizes total-power prediction accuracy.  Our
+FT-Transformer substantially outperforms both baselines: it reduces MAPE
+by 17\% relative to Ridge (3.61\% \vs 4.36\% on BOOM) and by 43\% relative
+to the MLP (3.61\% \vs 6.29\%).  FT-Transformer achieves $R^2$ of 0.925
+(BOOM) and 0.932 (XS), compared to 0.856/0.905 for Ridge and 0.629/0.858
+for the MLP.  These gains validate that \emph{explicit cross-feature
+attention improves power prediction} over models that either ignore
+interactions (Ridge) or learn them only implicitly (MLP).
+
+\begin{table}[t]
+\centering
+\small
+\caption{Total-power prediction on BOOM and XS (config-level holdout,
+val\_ratio=0.2).  Best deep learning result \underline{underlined};
+best overall in \textbf{bold}.}
+\label{tab:results}
+\begin{tabular}{l cc cc}
+\toprule
+& \multicolumn{2}{c}{\textbf{BOOM}} & \multicolumn{2}{c}{\textbf{XS}} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+\textbf{Model} & MAPE\% & $R^2$ & MAPE\% & $R^2$ \\
+\midrule
+Ridge        & 4.36 & 0.856 & 5.95 & 0.905 \\
+MLP          & 6.29 & 0.629 & 7.76 & 0.858 \\
+\midrule
+FT-Trans.    & \underline{3.61} & \underline{0.925} & \underline{5.33} & \underline{0.932} \\
+XGBoost      & \textbf{2.36} & \textbf{0.938} & \textbf{4.26} & \textbf{0.945} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Component-Level Analysis}
+
+Table~\ref{tab:component} compares per-component MAPE on BOOM.  While
+XGBoost leads on most components, FT-Transformer \emph{outperforms XGBoost
+on three components}: ROB (18.25\% \vs 25.75\%), RNU (28.71\% \vs
+39.18\%), and Others (30.51\% \vs 42.94\%).  These components' power
+depends on complex inter-unit interactions (\eg, ROB occupancy couples
+with rename width and issue-queue pressure), suggesting that attention
+provides a genuine advantage where cross-feature interactions dominate.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Selected per-component MAPE (\%) on BOOM.  Components where
+FT-Transformer outperforms XGBoost in \textbf{bold}.}
+\label{tab:component}
+\begin{tabular}{l rr}
+\toprule
+\textbf{Component} & \textbf{XGBoost} & \textbf{FT-Trans.} \\
+\midrule
+Total    &  2.36 &  3.61 \\
+BP       &  1.05 &  1.04 \\
+Regfile  & 13.24 & 14.34 \\
+ROB      & 25.75 & \textbf{18.25} \\
+RNU      & 39.18 & \textbf{28.71} \\
+Others   & 42.94 & \textbf{30.51} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Why XGBoost Leads---and Why This Will Change}
+
+XGBoost currently achieves the best total-power MAPE (2.36\% / 4.26\%),
+outperforming FT-Transformer by $\sim$1.3 percentage points.  We attribute
+this to a well-known phenomenon: \emph{tree-based ensembles dominate
+neural models in the small-data tabular
+regime}~\cite{gorishniy2021ft_transformer}.  With only 200 samples,
+gradient-boosted trees benefit from built-in feature selection and
+sample-efficient splitting.  The original FT-Transformer
+paper~\cite{gorishniy2021ft_transformer} shows that this gap
+\emph{narrows and reverses} as dataset size grows, motivating our plan to
+collect a larger dataset for the final report.
+
+\subsection{Next Steps}
+
+For the final report, we plan to:
+(1)~\textbf{Collect an expanded dataset} with additional CPU configurations
+and workloads (target 1{,}000+ samples), testing whether FT-Transformer
+surpasses XGBoost as expected;
+(2)~\textbf{Analyze attention maps} to identify previously unknown event
+interactions for CPU designers; and
+(3)~\textbf{Refine the model} with deeper variants and architectures that
+enforce the component-to-total summation constraint.
+
+{\small
+\bibliographystyle{ieeenat_fullname}
+\bibliography{references}
+}
+
+\end{document}
