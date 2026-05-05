@@ -1,0 +1,33 @@
+0:[rob.reads<-0.944962025] yes=1,no=2,missing=2
+	1:leaf=0.54807663
+	2:[rename.runCycles<-0.0840334743] yes=3,no=4,missing=4
+		3:[numCycles<-0.288892746] yes=5,no=6,missing=6
+			5:[decode.decodedInsts<-0.664072096] yes=9,no=10,missing=10
+				9:[numLoadInsts<0.199026793] yes=17,no=18,missing=18
+					17:leaf=-0.118063025
+					18:leaf=-0.0108160805
+				10:leaf=-0.272377878
+			6:[numCycles<-0.20893079] yes=11,no=12,missing=12
+				11:leaf=-0.00619585672
+				12:[BTBLookups<0.78374362] yes=19,no=20,missing=20
+					19:leaf=-0.131179973
+					20:leaf=-0.0503983982
+		4:[rob.reads<-0.103112102] yes=7,no=8,missing=8
+			7:[decode.runCycles<0.559817731] yes=13,no=14,missing=14
+				13:[insertedLoads<-0.276609808] yes=21,no=22,missing=22
+					21:leaf=0.0463934876
+					22:[decode.runCycles<0.177845985] yes=27,no=28,missing=28
+						27:leaf=-0.0013951048
+						28:leaf=-0.0304344092
+				14:[numCycles<-0.532851517] yes=23,no=24,missing=24
+					23:leaf=0.0748625696
+					24:leaf=0.215681687
+			8:[numCycles<-0.464082122] yes=15,no=16,missing=16
+				15:leaf=-0.179933622
+				16:[decode.runCycles<0.64669019] yes=25,no=26,missing=26
+					25:[icache.mshrHits<-0.706414819] yes=29,no=30,missing=30
+						29:leaf=0.0236579832
+						30:leaf=-0.0388041213
+					26:[totalIpc<2.35339546] yes=31,no=32,missing=32
+						31:leaf=0.0587004013
+						32:leaf=0.0134573653
