@@ -507,6 +507,12 @@ def main():
     parser.add_argument("--fs_mcp_lambda_path_len", type=int, default=50)
     parser.add_argument("--fs_deep_v_i_multiplier", type=int, default=3)
     parser.add_argument("--fs_deep_max_swap_iters", type=int, default=20)
+    parser.add_argument("--fs_n_jobs", type=int, default=-1,
+                        help="Parallelism for sklearn estimators (LassoCV, RF, "
+                             "SFS) and joblib-parallel mutual_info_regression. "
+                             "-1 = all cores. MCP/DEEP coord descent is "
+                             "sequential by algorithm; numba is auto-used if "
+                             "installed.")
     parser.add_argument("--presim_subdir", type=str, default="presim")
 
     # FT-Transformer hyperparameters

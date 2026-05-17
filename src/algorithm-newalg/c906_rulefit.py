@@ -497,6 +497,13 @@ def main():
              "0 to skip step 2 (use OMP-only forward selection).",
     )
     parser.add_argument(
+        "--fs_n_jobs", type=int, default=-1,
+        help="Parallelism for sklearn estimators (LassoCV, RF, SFS) and "
+             "joblib-parallel mutual_info_regression. -1 = all cores. "
+             "MCP/DEEP coord descent is algorithmically sequential; numba "
+             "is auto-used if installed.",
+    )
+    parser.add_argument(
         "--presim_subdir", type=str, default="presim",
         help="Subdirectory under db/c906-db/ holding the *_func.pkl presim "
              "files (e.g. 'presim' or 'presim_large').",
