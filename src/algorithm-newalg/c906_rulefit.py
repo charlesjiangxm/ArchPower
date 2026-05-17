@@ -234,6 +234,22 @@ def run_one(label, X_train, y_train, X_test, y_test, args, out_dir):
 
     cols, _ = _select_columns(X_train, y_train, X_test, args)
 
+    label_dir = os.path.join(out_dir, label)
+    os.makedirs(label_dir, exist_ok=True)
+    selected_path = os.path.join(label_dir, "selected_features.pkl")
+    pd.to_pickle(
+        {
+            "cols": list(cols),
+            "X_train": X_train[cols],
+            "y_train": y_train,
+            "X_test": X_test[cols],
+            "y_test": y_test,
+            "fs_method": args.fs_method,
+        },
+        selected_path,
+    )
+    print(f"  saved selected features -> {selected_path}")
+
     # float64 throughout: with the new FeatureSelector, wide-bus signals
     # (values up to ~1e25) may survive selection. A float32 cast would
     # silently turn them into +inf and crash sklearn validation in RuleFit.
@@ -270,8 +286,6 @@ def run_one(label, X_train, y_train, X_test, y_test, args, out_dir):
           f"linear nonzero={(nonzero['type']=='linear').sum()}  "
           f"rule nonzero={(nonzero['type']=='rule').sum()}")
 
-    label_dir = os.path.join(out_dir, label)
-    os.makedirs(label_dir, exist_ok=True)
     rules.to_csv(os.path.join(label_dir, "rules.csv"), index=False)
     plot_top_rules(rules, os.path.join(label_dir, "top_rules.png"))
 
