@@ -16,6 +16,7 @@ Two split modes:
 Outputs go to ../../output/ft_c906_<split>[_<fs_method>][_<presim_subdir>]/.
 
 Usage (from src/algorithm-newalg/):
+  python c906_ft_transformer.py --split time_ordered --fs_method none
   python c906_ft_transformer.py --split time_ordered --fs_method pearson
   python c906_ft_transformer.py --split time_ordered --fs_method mcp
 """
@@ -159,19 +160,37 @@ def _split_per_category(X, y, category, val_ratio, seed):
 # Training one fold/category
 # ---------------------------------------------------------------------------
 
+def _select_columns(X_train, y_train, args):
+    """Return the columns to train on and elapsed selector time.
+
+    ``--fs_method none`` intentionally bypasses FeatureSelector and keeps the
+    raw input columns, including constant columns.  ``top_k`` is ignored in
+    this mode.
+    """
+    t_fs = time.time()
+    if args.fs_method == "none":
+        cols = list(X_train.columns)
+        fs_seconds = time.time() - t_fs
+        print(f"  feature selection bypassed: using all {len(cols)} features "
+              f"(top_k ignored, {fs_seconds:.1f}s)")
+        return cols, fs_seconds
+
+    selector = FeatureSelector.from_args(args)
+    cols = selector.fit_select(X_train, y_train)
+    fs_seconds = time.time() - t_fs
+    print(f"  features kept: {len(cols)} via fs_method={args.fs_method} "
+          f"({fs_seconds:.1f}s)")
+    return cols, fs_seconds
+
+
 def run_one(label, X_train, y_train, X_test, y_test, args, out_dir,
             *, category_train=None, split_mode):
     t0 = time.time()
     print(f"\n=== {label} ===")
     print(f"  train rows: {len(X_train):,}   test rows: {len(X_test):,}")
 
-    # Feature selection
-    selector = FeatureSelector.from_args(args)
-    t_fs = time.time()
-    cols = selector.fit_select(X_train, y_train)
-    fs_seconds = time.time() - t_fs
-    print(f"  features kept: {len(cols)} via fs_method={args.fs_method} "
-          f"({fs_seconds:.1f}s)")
+    # Feature selection, unless explicitly bypassed.
+    cols, fs_seconds = _select_columns(X_train, y_train, args)
 
     # Internal val split (for early stopping)
     if split_mode == "time_ordered":
@@ -398,12 +417,14 @@ def write_report(args, results, global_scores, out_dir, device):
     lines = []
     lines.append(f"# FT-Transformer on c906-db -- split = `{args.split}`\n")
     lines.append("## Hyperparameters\n")
-    lines.append(f"- top_k (features): {args.top_k}")
+    lines.append(f"- top_k (features): {args.top_k}"
+                 f"{' (ignored; feature selection bypassed)' if args.fs_method == 'none' else ''}")
     lines.append(f"- presim_subdir: {args.presim_subdir}")
     lines.append(f"- seed: {args.seed}")
     if args.split == "time_ordered":
         lines.append(f"- test_ratio: {args.test_ratio}")
-    lines.append(f"- fs_method: {args.fs_method}")
+    lines.append(f"- fs_method: {args.fs_method}"
+                 f"{' (feature selection bypassed)' if args.fs_method == 'none' else ''}")
     if args.fs_method == "univariate":
         lines.append(f"- fs_score_func: {args.fs_score_func}")
     if args.fs_method == "variance":
@@ -485,13 +506,20 @@ def main():
     parser = argparse.ArgumentParser(
         description="FT-Transformer on c906-db power data")
     parser.add_argument("--split", choices=["loco", "time_ordered"], required=True)
-    parser.add_argument("--top_k", type=int, default=1000)
+    parser.add_argument("--top_k", type=int, default=1000,
+                        help="Number of features to keep; ignored when "
+                             "--fs_method none")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--test_ratio", type=float, default=0.2,
                         help="Used only when --split time_ordered")
 
     # Feature-selection knobs (copy of c906_rulefit.py)
-    parser.add_argument("--fs_method", choices=FeatureSelector.METHODS, default="pearson")
+    fs_choices = ("none",) + tuple(FeatureSelector.METHODS)
+    parser.add_argument(
+        "--fs_method", choices=fs_choices, default="pearson",
+        help="Feature-selection method. Use 'none' to bypass FeatureSelector "
+             "and train on all input columns (top_k is ignored).",
+    )
     parser.add_argument("--fs_score_func",
                         choices=["f_regression", "mutual_info_regression"],
                         default="f_regression")

@@ -22,6 +22,7 @@ Outputs (per split mode) go to ../../output/rulefit_c906_<split>/:
     interaction_heatmap.png
 
 Usage (from src/algorithm-newalg/):
+  python c906_rulefit.py --split time_ordered --fs_method none
   python c906_rulefit.py --split loco --top_k 1000 --max_rules 2000
   python c906_rulefit.py --split time_ordered --top_k 1000 --max_rules 2000
 """
@@ -180,17 +181,58 @@ def plot_pred_vs_true(y_true, y_pred, out_path, title="Predicted vs True"):
 # Training loop (one fold or one category)
 # ---------------------------------------------------------------------------
 
+def _select_columns(X_train, y_train, X_test, args):
+    """Return the columns to train on and elapsed selector time.
+
+    ``--fs_method none`` bypasses FeatureSelector and keeps the raw input
+    columns, including constant columns. ``top_k`` is ignored.  RuleFit's
+    tree ensemble internally casts to float32, so this bypass mode still drops
+    columns whose train/test values cannot be represented in float32; that is
+    a model-compatibility guard rather than a scoring/ranking selector.
+    """
+    t_fs = time.time()
+    if args.fs_method == "none":
+        cols = list(X_train.columns)
+
+        # Compatibility guard for RuleFit / sklearn GBRT internals.
+        f32_max = float(np.finfo(np.float32).max)
+        Xtr_raw = X_train[cols].to_numpy(dtype=np.float64, copy=False)
+        Xte_raw = X_test[cols].to_numpy(dtype=np.float64, copy=False)
+        train_abs_max = np.nanmax(np.abs(Xtr_raw), axis=0)
+        test_abs_max = np.nanmax(np.abs(Xte_raw), axis=0)
+        abs_max = np.maximum(train_abs_max, test_abs_max)
+        safe = np.isfinite(abs_max) & (abs_max < f32_max)
+        if not safe.all():
+            n_drop = int((~safe).sum())
+            cols = [c for c, keep in zip(cols, safe) if keep]
+            print(f"  feature selection bypassed: dropped {n_drop} columns "
+                  f"that would overflow RuleFit's float32 tree backend")
+        if not cols:
+            raise RuntimeError(
+                "No feature columns remain after RuleFit float32 compatibility "
+                "filter in --fs_method none mode."
+            )
+
+        fs_seconds = time.time() - t_fs
+        print(f"  feature selection bypassed: using {len(cols)} / "
+              f"{X_train.shape[1]} features (top_k ignored, {fs_seconds:.1f}s)")
+        return cols, fs_seconds
+
+    selector = FeatureSelector.from_args(args)
+    cols = selector.fit_select(X_train, y_train)
+    fs_seconds = time.time() - t_fs
+    print(f"  features kept: {len(cols)} via fs_method={args.fs_method} "
+          f"({fs_seconds:.1f}s)")
+    return cols, fs_seconds
+
+
 def run_one(label, X_train, y_train, X_test, y_test, args, out_dir):
     """Train + evaluate + dump artifacts for one fold/category."""
     t0 = time.time()
     print(f"\n=== {label} ===")
     print(f"  train rows: {len(X_train):,}   test rows: {len(X_test):,}")
 
-    selector = FeatureSelector.from_args(args)
-    t_fs = time.time()
-    cols = selector.fit_select(X_train, y_train)
-    print(f"  features kept: {len(cols)} via fs_method={args.fs_method} "
-          f"({time.time() - t_fs:.1f}s)")
+    cols, _ = _select_columns(X_train, y_train, X_test, args)
 
     # float64 throughout: with the new FeatureSelector, wide-bus signals
     # (values up to ~1e25) may survive selection. A float32 cast would
@@ -350,14 +392,16 @@ def write_report(args, results, global_scores, out_dir):
     lines = []
     lines.append(f"# RuleFit on c906-db -- split = `{args.split}`\n")
     lines.append("## Hyperparameters\n")
-    lines.append(f"- top_k (features): {args.top_k}")
+    lines.append(f"- top_k (features): {args.top_k}"
+                 f"{' (ignored; feature selection bypassed)' if args.fs_method == 'none' else ''}")
     lines.append(f"- tree_size: {args.tree_size}")
     lines.append(f"- max_rules: {args.max_rules}")
     lines.append(f"- memory_par: {args.memory_par}")
     lines.append(f"- seed: {args.seed}")
     lines.append(f"- lasso_mode: {args.lasso_mode}"
                  f"{' (LassoCV positive=True; all coefficients >= 0)' if args.lasso_mode == 'nonneg' else ''}")
-    lines.append(f"- fs_method: {args.fs_method}")
+    lines.append(f"- fs_method: {args.fs_method}"
+                 f"{' (feature selection bypassed)' if args.fs_method == 'none' else ''}")
     if args.fs_method == "univariate":
         lines.append(f"- fs_score_func: {args.fs_score_func}")
     if args.fs_method == "variance":
@@ -422,7 +466,8 @@ def main():
     parser = argparse.ArgumentParser(description="RuleFit on c906-db power data")
     parser.add_argument("--split", choices=["loco", "time_ordered"], required=True)
     parser.add_argument("--top_k", type=int, default=1000,
-                        help="Number of features to keep by |corr| after zero-var drop")
+                        help="Number of features to keep by |corr| after "
+                             "zero-var drop; ignored when --fs_method none")
     parser.add_argument("--tree_size", type=int, default=4)
     parser.add_argument("--max_rules", type=int, default=2000)
     parser.add_argument("--memory_par", type=float, default=0.01)
@@ -433,12 +478,15 @@ def main():
                         help="Lasso for the final RuleFit linear stage. "
                              "'normal' = standard LassoCV (signed coefs); "
                              "'nonneg' = LassoCV with positive=True (coefs >= 0).")
+    fs_choices = ("none",) + tuple(FeatureSelector.METHODS)
     parser.add_argument(
-        "--fs_method", choices=FeatureSelector.METHODS, default="pearson",
+        "--fs_method", choices=fs_choices, default="pearson",
         help="Feature-selection method run before RuleFit. Default 'pearson' "
-             "matches the legacy filter_features behavior. All methods "
-             "standardize features in float64 first (fixing the float32 "
-             "overflow on wide-bus signals).",
+             "matches the legacy filter_features behavior. All non-'none' "
+             "methods standardize features in float64 first (fixing the "
+             "float32 overflow on wide-bus signals). Use 'none' to bypass "
+             "FeatureSelector and train on all input columns; top_k is ignored "
+             "and only RuleFit float32-incompatible columns are dropped.",
     )
     parser.add_argument(
         "--fs_score_func", choices=["f_regression", "mutual_info_regression"],
