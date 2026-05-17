@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run the FT-Transformer × FeatureSelector sweep on c906-db.
 #
-# Iterates over 7 selectors (sequential is excluded), trains FT-Transformer on
+# Iterates over 6 selectors (sequential and from_model are excluded), trains FT-Transformer on
 # the selected columns for each, captures wall time and a stdout log per
 # method, then aggregates the per-method output directories into a single
 # sweep folder with a generated SUMMARY.md.
@@ -19,7 +19,7 @@
 #   --device       auto    (FT-Transformer auto-selects mps/cuda/cpu)
 #
 # --skip-run        only aggregates outputs already on disk
-# --skip-aggregate  runs the 7 trainings but doesn't bundle them into SWEEP_DIR
+# --skip-aggregate  runs the 6 trainings but doesn't bundle them into SWEEP_DIR
 # --extra           appended verbatim to every c906_ft_transformer.py invocation
 #                   (useful for e.g. --ft_max_epochs 200, --ft_n_blocks 2 etc.)
 
@@ -56,8 +56,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Methods to sweep (sequential intentionally excluded).
-METHODS=(pearson variance univariate rfe from_model mcp deep)
+# Methods to sweep (sequential and from_model intentionally excluded).
+METHODS=(pearson variance univariate rfe mcp deep)
 
 # ---------------------------------------------------------------------------
 # Resolve paths relative to this script.
@@ -95,7 +95,9 @@ out_dir_for() {
 # ---------------------------------------------------------------------------
 
 WALLTIMES_FILE="$LOG_DIR/walltimes.tsv"
-: > "$WALLTIMES_FILE"
+if [[ $SKIP_RUN -eq 0 ]]; then
+  : > "$WALLTIMES_FILE"
+fi
 
 if [[ $SKIP_RUN -eq 0 ]]; then
   for method in "${METHODS[@]}"; do
@@ -105,8 +107,9 @@ if [[ $SKIP_RUN -eq 0 ]]; then
     echo "  Running method=$method  (log: $log_file)"
     echo "------------------------------------------------------------"
     t0=$(date +%s)
-    # shellcheck disable=SC2086  # we want word-splitting on $EXTRA_ARGS
-    python "$RUNNER" \
+    # shellcheck disable=SC2086  # we want word-splitting on $EXTRA_ARGS/$method_extra
+    set +e
+    PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 python -X faulthandler "$RUNNER" \
         --split "$SPLIT" \
         --fs_method "$method" \
         --presim_subdir "$PRESIM" \
@@ -114,6 +117,7 @@ if [[ $SKIP_RUN -eq 0 ]]; then
         $EXTRA_ARGS \
         > "$log_file" 2>&1
     rc=$?
+    set -e
     t1=$(date +%s)
     secs=$((t1 - t0))
     if [[ $rc -ne 0 ]]; then
@@ -155,9 +159,9 @@ if [[ $SKIP_AGG -eq 0 ]]; then
 
   # SUMMARY.md generation via inline Python.
   python - "$SWEEP_PATH" "$WALLTIMES_FILE" "$SPLIT" "$PRESIM" <<'PY'
-import os, re, sys
+import os, sys
 sweep, walls_file, split, presim = sys.argv[1:5]
-methods = ["pearson","variance","univariate","rfe","from_model","mcp","deep"]
+methods = ["pearson","variance","univariate","rfe","mcp","deep"]
 categories_order = ["MMU","cache","csr","exception","interrupt"]
 
 # Wall times.
@@ -169,8 +173,8 @@ if os.path.exists(walls_file):
         m, s = ln.split("\t")
         walls[m] = int(s.rstrip("s"))
 
-# Per-method, parse the report.md table for test R^2 per category.
-metric_re = re.compile(r"^\|\s*(\S+)\s*\|.+\|\s*([-\d.]+)\s*\|\s*[-\d.]+\s*\|\s*([-\d.]+)\s*\|\s*[\d.]+\s*\|\s*[-\d.]+s?\s*\|\s*$")
+# Per-method, parse the report.md table for train/test R^2 per category.
+train_r2 = {}     # method -> {category -> r2}
 test_r2 = {}      # method -> {category -> r2}
 feats   = {}      # method -> {category -> feats}
 best_ep = {}      # method -> {category -> best_epoch}
@@ -178,7 +182,7 @@ for m in methods:
     rep = os.path.join(sweep, m, "report.md")
     if not os.path.exists(rep):
         continue
-    test_r2[m] = {}; feats[m] = {}; best_ep[m] = {}
+    train_r2[m] = {}; test_r2[m] = {}; feats[m] = {}; best_ep[m] = {}
     in_table = False
     for ln in open(rep):
         if ln.startswith("## Per-fold"):
@@ -193,10 +197,12 @@ for m in methods:
         if len(parts) < 12: continue
         try:
             label, n_tr, n_te, fkept = parts[0], parts[1], parts[2], int(parts[3])
+            r2_tr = float(parts[6])
             r2_te = float(parts[9])
             be    = int(parts[10])
         except ValueError:
             continue
+        train_r2[m][label] = r2_tr
         test_r2[m][label] = r2_te
         feats[m][label]   = fkept
         best_ep[m][label] = be
@@ -225,9 +231,26 @@ if total:
     out.append(f"**Total ≈ {total/60.0:.1f} min**")
     out.append("")
 
-# Test-set R² table.
-cats = [c for c in categories_order if any(c in test_r2.get(m, {}) for m in methods)]
+cats = [
+    c for c in categories_order
+    if any(c in train_r2.get(m, {}) or c in test_r2.get(m, {}) for m in methods)
+]
 if cats:
+    # Train-set R² table.
+    out.append("## Train-set R² per category\n")
+    out.append("| Method | feats (avg) | " + " | ".join(cats) + " |")
+    out.append("|---|---:|" + "|".join(["---:"] * len(cats)) + "|")
+    for m in methods:
+        if m not in train_r2: continue
+        f_avg = sum(feats[m].values()) / max(len(feats[m]), 1) if feats.get(m) else 0
+        row = [m, f"{f_avg:.0f}"]
+        for c in cats:
+            v = train_r2[m].get(c)
+            row.append(f"{v:.3f}" if v is not None else "—")
+        out.append("| " + " | ".join(row) + " |")
+    out.append("")
+
+    # Test-set R² table.
     out.append("## Test-set R² per category\n")
     out.append("| Method | feats (avg) | " + " | ".join(cats) + " |")
     out.append("|---|---:|" + "|".join(["---:"] * len(cats)) + "|")
@@ -240,7 +263,7 @@ if cats:
             row.append(f"{v:.3f}" if v is not None else "—")
         out.append("| " + " | ".join(row) + " |")
     out.append("")
-    out.append("> Per-fold R² is read from each method's `report.md`. Best-epoch "
+    out.append("> Per-fold train/test R² is read from each method's `report.md`. Best-epoch "
                "and full metric tables live in the per-method subfolders.")
     out.append("")
 

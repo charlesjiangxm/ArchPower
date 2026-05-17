@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run the RuleFit x FeatureSelector sweep on c906-db.
 #
-# Iterates over 7 selectors (sequential is excluded), trains RuleFit on the
+# Iterates over 6 selectors (sequential and from_model are excluded), trains RuleFit on the
 # selected columns for each, captures wall time and a stdout log per method,
 # then aggregates the per-method output directories into a single sweep folder
 # with a generated SUMMARY.md.
@@ -18,7 +18,7 @@
 #   --sweep-dir    rulefit_c906_sweep_feature_selection_presim
 #
 # --skip-run        only aggregates outputs already on disk
-# --skip-aggregate  runs the 7 trainings but doesn't bundle them into SWEEP_DIR
+# --skip-aggregate  runs the 6 trainings but doesn't bundle them into SWEEP_DIR
 # --extra           appended verbatim to every c906_rulefit.py invocation
 #                   (e.g. --top_k 1000, --max_rules 2000, --lasso_mode nonneg).
 #                   If --lasso_mode nonneg is present, the script tracks the
@@ -55,8 +55,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Methods to sweep (sequential intentionally excluded).
-METHODS=(pearson variance univariate rfe from_model mcp deep)
+# Methods to sweep (sequential and from_model intentionally excluded).
+METHODS=(pearson variance univariate rfe mcp deep)
 
 # c906_rulefit.py adds a "_nonneg" suffix when --lasso_mode nonneg is set.
 # Peek at EXTRA_ARGS so out_dir_for() points at the right paths.
@@ -163,7 +163,7 @@ if [[ $SKIP_AGG -eq 0 ]]; then
   python - "$SWEEP_PATH" "$WALLTIMES_FILE" "$SPLIT" "$PRESIM" "$LASSO_MODE" <<'PY'
 import os, sys
 sweep, walls_file, split, presim, lasso_mode = sys.argv[1:6]
-methods = ["pearson","variance","univariate","rfe","from_model","mcp","deep"]
+methods = ["pearson","variance","univariate","rfe","mcp","deep"]
 categories_order = ["MMU","cache","csr","exception","interrupt"]
 
 # Wall times.
@@ -175,8 +175,9 @@ if os.path.exists(walls_file):
         m, s = ln.split("\t")
         walls[m] = int(s.rstrip("s"))
 
-# Per-method, parse the report.md table for test R^2, feats and rules per
+# Per-method, parse the report.md table for train/test R^2, feats and rules per
 # category. rulefit's table is 11 columns (no best_epoch).
+train_r2 = {}     # method -> {category -> r2}
 test_r2 = {}      # method -> {category -> r2}
 feats   = {}      # method -> {category -> feats}
 rules   = {}      # method -> {category -> "nz/total"}
@@ -184,7 +185,7 @@ for m in methods:
     rep = os.path.join(sweep, m, "report.md")
     if not os.path.exists(rep):
         continue
-    test_r2[m] = {}; feats[m] = {}; rules[m] = {}
+    train_r2[m] = {}; test_r2[m] = {}; feats[m] = {}; rules[m] = {}
     in_table = False
     for ln in open(rep):
         if ln.startswith("## Per-fold"):
@@ -201,9 +202,11 @@ for m in methods:
             label   = parts[0]
             fkept   = int(parts[3])
             nz_tot  = parts[4]
+            r2_tr   = float(parts[7])
             r2_te   = float(parts[10])
         except ValueError:
             continue
+        train_r2[m][label] = r2_tr
         test_r2[m][label] = r2_te
         feats[m][label]   = fkept
         rules[m][label]   = nz_tot
@@ -233,10 +236,27 @@ if total:
     out.append("")
 
 # Categories actually present in at least one method's table.
-cats = [c for c in categories_order if any(c in test_r2.get(m, {}) for m in methods)]
+cats = [
+    c for c in categories_order
+    if any(c in train_r2.get(m, {}) or c in test_r2.get(m, {}) for m in methods)
+]
 
-# Test-set R^2 table.
 if cats:
+    # Train-set R^2 table.
+    out.append("## Train-set R² per category\n")
+    out.append("| Method | feats (avg) | " + " | ".join(cats) + " |")
+    out.append("|---|---:|" + "|".join(["---:"] * len(cats)) + "|")
+    for m in methods:
+        if m not in train_r2: continue
+        f_avg = sum(feats[m].values()) / max(len(feats[m]), 1) if feats.get(m) else 0
+        row = [m, f"{f_avg:.0f}"]
+        for c in cats:
+            v = train_r2[m].get(c)
+            row.append(f"{v:.3f}" if v is not None else "-")
+        out.append("| " + " | ".join(row) + " |")
+    out.append("")
+
+    # Test-set R^2 table.
     out.append("## Test-set R² per category\n")
     out.append("| Method | feats (avg) | " + " | ".join(cats) + " |")
     out.append("|---|---:|" + "|".join(["---:"] * len(cats)) + "|")
@@ -249,7 +269,7 @@ if cats:
             row.append(f"{v:.3f}" if v is not None else "-")
         out.append("| " + " | ".join(row) + " |")
     out.append("")
-    out.append("> Per-fold R² is read from each method's `report.md`. Full "
+    out.append("> Per-fold train/test R² is read from each method's `report.md`. Full "
                "metric tables (train/test RMSE, MAPE, R²) and rule listings "
                "live in the per-method subfolders.")
     out.append("")
