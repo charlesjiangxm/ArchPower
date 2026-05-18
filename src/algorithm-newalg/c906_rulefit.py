@@ -42,9 +42,10 @@ from rulefit import RuleFit
 from c906_rulefit_utils import (
     PREFIXES, load_c906_pair, load_all,
     compute_metrics, parse_rule_features,
-    refit_nonneg_lasso,
+    refit_nonneg_lasso, validate_presim_subdir,
 )
 from feature_selectors import FeatureSelector
+from ft_transformer_model import Standardizer
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +237,23 @@ def run_one(label, X_train, y_train, X_test, y_test, args, out_dir):
 
     label_dir = os.path.join(out_dir, label)
     os.makedirs(label_dir, exist_ok=True)
+
+    # Keep raw arrays in float64, then z-score both X and y before giving them
+    # to RuleFit.  This is essential for c906: selected bus-value features can
+    # be as large as ~1e38.  RuleFit's internal LassoCV builds its alpha grid
+    # from the model matrix; with those huge uncentered/raw values the alpha
+    # grid becomes enormous and the final sparse linear stage selects all-zero
+    # coefficients, i.e. an intercept-only model with train R² = 0.
+    Xtr = X_train[cols].to_numpy(dtype=np.float64, copy=False)
+    Xte = X_test[cols].to_numpy(dtype=np.float64, copy=False)
+    ytr = y_train.to_numpy(dtype=np.float64, copy=False)
+    yte = y_test.to_numpy(dtype=np.float64, copy=False)
+    std = Standardizer.fit(Xtr, ytr)
+    Xtr_z = std.transform_X(Xtr)
+    Xte_z = std.transform_X(Xte)
+    ytr_z = std.transform_y(ytr)
+    print("  preprocessing: z-scored selected X and target y before RuleFit")
+
     selected_path = os.path.join(label_dir, "selected_features.pkl")
     pd.to_pickle(
         {
@@ -245,18 +263,16 @@ def run_one(label, X_train, y_train, X_test, y_test, args, out_dir):
             "X_test": X_test[cols],
             "y_test": y_test,
             "fs_method": args.fs_method,
+            "preprocessing": "zscore_selected_X_and_y_before_rulefit",
+            "rule_units": "standardized_X_thresholds_and_standardized_y_coefficients",
+            "x_mean": std.x_mean,
+            "x_std": std.x_std,
+            "y_mean": std.y_mean,
+            "y_std": std.y_std,
         },
         selected_path,
     )
     print(f"  saved selected features -> {selected_path}")
-
-    # float64 throughout: with the new FeatureSelector, wide-bus signals
-    # (values up to ~1e25) may survive selection. A float32 cast would
-    # silently turn them into +inf and crash sklearn validation in RuleFit.
-    Xtr = X_train[cols].to_numpy(dtype=np.float64, copy=False)
-    Xte = X_test[cols].to_numpy(dtype=np.float64, copy=False)
-    ytr = y_train.to_numpy(dtype=np.float64, copy=False)
-    yte = y_test.to_numpy(dtype=np.float64, copy=False)
 
     rf = RuleFit(
         tree_size=args.tree_size,
@@ -266,14 +282,14 @@ def run_one(label, X_train, y_train, X_test, y_test, args, out_dir):
         random_state=args.seed,
     )
     print(f"  fitting RuleFit (tree_size={args.tree_size}, max_rules={args.max_rules}) ...")
-    rf.fit(Xtr, ytr, feature_names=cols)
+    rf.fit(Xtr_z, ytr_z, feature_names=cols)
 
     if args.lasso_mode == "nonneg":
         print("  refitting Lasso with positive=True (non-negative coefficients) ...")
-        refit_nonneg_lasso(rf, Xtr, ytr, random_state=args.seed)
+        refit_nonneg_lasso(rf, Xtr_z, ytr_z, random_state=args.seed)
 
-    yp_tr = rf.predict(Xtr)
-    yp_te = rf.predict(Xte)
+    yp_tr = std.inverse_y(rf.predict(Xtr_z))
+    yp_te = std.inverse_y(rf.predict(Xte_z))
     m_tr = compute_metrics(ytr, yp_tr)
     m_te = compute_metrics(yte, yp_te)
     print(f"  train: RMSE={m_tr['rmse']:.5f}  MAPE={m_tr['mape']:.2f}%  R²={m_tr['r2']:.4f}")
@@ -412,6 +428,11 @@ def write_report(args, results, global_scores, out_dir):
     lines.append(f"- max_rules: {args.max_rules}")
     lines.append(f"- memory_par: {args.memory_par}")
     lines.append(f"- seed: {args.seed}")
+    lines.append("- preprocessing: selected X columns and target y are z-scored "
+                 "on the training split before RuleFit; predictions are "
+                 "inverse-transformed before metrics/plots")
+    lines.append("- rule units: `rules.csv` thresholds and coefficients are in "
+                 "the standardized RuleFit model space")
     lines.append(f"- lasso_mode: {args.lasso_mode}"
                  f"{' (LassoCV positive=True; all coefficients >= 0)' if args.lasso_mode == 'nonneg' else ''}")
     lines.append(f"- fs_method: {args.fs_method}"
@@ -566,11 +587,16 @@ def main():
              "is auto-used if installed.",
     )
     parser.add_argument(
-        "--presim_subdir", type=str, default="presim",
-        help="Subdirectory under db/c906-db/ holding the *_func.pkl presim "
-             "files (e.g. 'presim' or 'presim_large').",
+        "--presim_subdir", "--presim", dest="presim_subdir",
+        type=str, default="presim",
+        help="Folder name under db/c906-db holding *_func.pkl presim files "
+             "(e.g. presim, presim_large, presim_no_addr_data).",
     )
     args = parser.parse_args()
+    try:
+        args.presim_subdir = validate_presim_subdir(args.presim_subdir)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     warnings.filterwarnings("ignore", category=FutureWarning)
 

@@ -14,7 +14,7 @@
 #
 # Defaults:
 #   --split        time_ordered
-#   --presim       presim
+#   --presim       presim_large (any folder under db/c906-db)
 #   --sweep-dir    ft_transformer_c906_sweep_feature_selection_presim
 #   --device       auto    (FT-Transformer auto-selects mps/cuda/cpu)
 #
@@ -30,7 +30,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 
 SPLIT="time_ordered"
-PRESIM="presim"
+PRESIM="presim_large"
 SWEEP_DIR="ft_transformer_c906_sweep_feature_selection_presim"
 DEVICE="auto"
 SKIP_RUN=0
@@ -67,6 +67,18 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUNNER="$SCRIPT_DIR/c906_ft_transformer.py"
 OUTPUT_DIR="$REPO_ROOT/output"
+DB_DIR="$REPO_ROOT/db/c906-db"
+if [[ -z "$PRESIM" || "$PRESIM" == "." || "$PRESIM" == ".." || "$PRESIM" == */* ]]; then
+  echo "Invalid --presim '$PRESIM': pass a single folder name under $DB_DIR" >&2
+  exit 2
+fi
+PRESIM_DIR="$DB_DIR/$PRESIM"
+if [[ ! -d "$PRESIM_DIR" ]]; then
+  echo "Invalid --presim '$PRESIM': $PRESIM_DIR is not a directory." >&2
+  echo "Available folders under $DB_DIR:" >&2
+  find "$DB_DIR" -mindepth 1 -maxdepth 1 -type d ! -name pwr ! -name '__*' -printf '  - %f\n' | sort >&2 || true
+  exit 2
+fi
 LOG_DIR="$OUTPUT_DIR/_ft_sweep_logs"
 mkdir -p "$LOG_DIR"
 

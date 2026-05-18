@@ -1,10 +1,10 @@
 """
-FT-Transformer regression on the c906-db dataset.
+XGBoost GBDT regression on the c906-db dataset.
 
-Mirrors the shape of c906_rulefit.py but swaps the downstream model from
-RuleFit to FT-Transformer (Gorishniy et al., NeurIPS 2021).  Feature
-selection is delegated to the same `FeatureSelector` class used by the
-RuleFit pipeline.
+Mirrors the shape of c906_ft_transformer.py but swaps the downstream model
+for an XGBRegressor with early stopping on an internal validation split.
+Feature selection is delegated to the same `FeatureSelector` class used by
+the RuleFit / FT-Transformer pipelines.
 
 Two split modes:
 
@@ -13,16 +13,17 @@ Two split modes:
 * time_ordered  -- per-category 80/20 split by ascending time_ps. One
                    model per category.
 
-Outputs go to ../../output/ft_c906_<split>[_<fs_method>][_<presim_subdir>]/.
+Outputs go to ../../output/gbdt_c906_<split>[_<fs_method>][_<presim_subdir>]/.
 
 Usage (from src/algorithm-newalg/):
-  python c906_ft_transformer.py --split time_ordered --fs_method none
-  python c906_ft_transformer.py --split time_ordered --fs_method pearson
-  python c906_ft_transformer.py --split time_ordered --fs_method mcp
+  python c906_gbdt.py --split time_ordered --fs_method none
+  python c906_gbdt.py --split time_ordered --fs_method pearson
+  python c906_gbdt.py --split time_ordered --fs_method mcp
 """
 
 import argparse
 import os
+import pickle
 import time
 import warnings
 
@@ -31,21 +32,18 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import torch
+import xgboost as xgb
 
 from c906_rulefit_utils import (
     PREFIXES, load_c906_pair, compute_metrics, validate_presim_subdir,
 )
 from feature_selectors import FeatureSelector
-from ft_transformer_model import (
-    FTTransformer, Standardizer, default_device, describe_device,
-    train_ft_transformer, predict as ft_predict, extract_attention,
-)
+from ft_transformer_model import Standardizer
 
 
 # ---------------------------------------------------------------------------
-# Plotting helpers (copied/adapted from c906_rulefit.py so the two scripts
-# stay independent).
+# Plotting helpers (copied from c906_ft_transformer.py so this script stays
+# independent).
 # ---------------------------------------------------------------------------
 
 def _shorten(name, max_len=70):
@@ -56,13 +54,13 @@ def _shorten(name, max_len=70):
 
 def plot_training_curve(history, out_path):
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(history["train_loss"], label="train (MSE on z-y)", color="#1f77b4")
-    ax.plot(history["val_loss"], label="val (MSE on z-y)", color="#d62728")
+    ax.plot(history["train_loss"], label="train (RMSE on z-y)", color="#1f77b4")
+    ax.plot(history["val_loss"], label="val (RMSE on z-y)", color="#d62728")
     ax.axvline(history["best_epoch"], color="gray", linestyle="--", lw=1,
-               label=f"best epoch={history['best_epoch']}")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("MSE (standardized y)")
-    ax.set_title("Training and validation loss")
+               label=f"best iter={history['best_epoch']}")
+    ax.set_xlabel("Boosting round")
+    ax.set_ylabel("RMSE (standardized y)")
+    ax.set_title("Training and validation RMSE")
     ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
@@ -85,7 +83,8 @@ def plot_pred_vs_true(y_true, y_pred, out_path, title="Predicted vs True"):
     plt.close(fig)
 
 
-def plot_top_features(feat_scores, out_path, top_n=30, title="Top features"):
+def plot_top_features(feat_scores, out_path, top_n=30, title="Top features",
+                      xlabel="XGBoost feature importance (gain)"):
     df = feat_scores.head(top_n)
     if df.empty:
         return
@@ -94,42 +93,18 @@ def plot_top_features(feat_scores, out_path, top_n=30, title="Top features"):
     ax.barh(y_pos, df.values, color="#1f77b4")
     ax.set_yticks(y_pos)
     ax.set_yticklabels([_shorten(n, 80) for n in df.index], fontsize=7)
-    ax.set_xlabel("CLS attention (mean over heads, layers, test examples)")
+    ax.set_xlabel(xlabel)
     ax.set_title(title)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=120)
-    plt.close(fig)
-
-
-def plot_interaction_heatmap(M, top_features, out_path, title="Feature interactions"):
-    if M.size == 0 or M.max() == 0:
-        fig, ax = plt.subplots(figsize=(6, 2))
-        ax.text(0.5, 0.5, "No feature-feature attention to display.",
-                ha="center", va="center")
-        ax.axis("off")
-        fig.savefig(out_path, dpi=120)
-        plt.close(fig)
-        return
-    short = [_shorten(n, 50) for n in top_features]
-    fig, ax = plt.subplots(figsize=(11, 9))
-    im = ax.imshow(M, cmap="magma", aspect="auto")
-    ax.set_xticks(range(len(short)))
-    ax.set_yticks(range(len(short)))
-    ax.set_xticklabels(short, rotation=90, fontsize=6)
-    ax.set_yticklabels(short, fontsize=6)
-    ax.set_title(title)
-    fig.colorbar(im, ax=ax, label="attention weight (mean over heads/layers/examples)")
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
-# Validation split helpers
+# Split helpers (copied from c906_ft_transformer.py)
 # ---------------------------------------------------------------------------
 
 def _split_tail(X, y, val_ratio):
-    """Take the last `val_ratio` rows as validation. Preserves time order."""
     n_val = max(1, int(round(len(X) * val_ratio)))
     if n_val >= len(X):
         raise ValueError("val_ratio too large; would leave zero training rows.")
@@ -140,7 +115,6 @@ def _split_tail(X, y, val_ratio):
 
 
 def _split_per_category(X, y, category, val_ratio, seed):
-    """Per-prefix random validation split. Concats per-prefix slices."""
     rng = np.random.RandomState(seed)
     val_idx = []
     cats = pd.Series(category).reset_index(drop=True)
@@ -158,17 +132,7 @@ def _split_per_category(X, y, category, val_ratio, seed):
     )
 
 
-# ---------------------------------------------------------------------------
-# Training one fold/category
-# ---------------------------------------------------------------------------
-
 def _select_columns(X_train, y_train, args):
-    """Return the columns to train on and elapsed selector time.
-
-    ``--fs_method none`` intentionally bypasses FeatureSelector and keeps the
-    raw input columns, including constant columns.  ``top_k`` is ignored in
-    this mode.
-    """
     t_fs = time.time()
     if args.fs_method == "none":
         cols = list(X_train.columns)
@@ -185,23 +149,25 @@ def _select_columns(X_train, y_train, args):
     return cols, fs_seconds
 
 
+# ---------------------------------------------------------------------------
+# Training one fold/category
+# ---------------------------------------------------------------------------
+
 def run_one(label, X_train, y_train, X_test, y_test, args, out_dir,
             *, category_train=None, split_mode):
     t0 = time.time()
     print(f"\n=== {label} ===")
     print(f"  train rows: {len(X_train):,}   test rows: {len(X_test):,}")
 
-    # Feature selection, unless explicitly bypassed.
     cols, fs_seconds = _select_columns(X_train, y_train, args)
 
-    # Internal val split (for early stopping)
     if split_mode == "time_ordered":
-        X_tt, y_tt, X_tv, y_tv = _split_tail(X_train, y_train, args.ft_val_ratio)
+        X_tt, y_tt, X_tv, y_tv = _split_tail(X_train, y_train, args.gbdt_val_ratio)
     else:
         if category_train is None:
             raise ValueError("category_train is required for loco split mode.")
         X_tt, y_tt, X_tv, y_tv = _split_per_category(
-            X_train, y_train, category_train, args.ft_val_ratio, args.seed,
+            X_train, y_train, category_train, args.gbdt_val_ratio, args.seed,
         )
     print(f"  train-train: {len(X_tt):,}   train-val: {len(X_tv):,}")
 
@@ -214,47 +180,59 @@ def run_one(label, X_train, y_train, X_test, y_test, args, out_dir,
     yte = y_test.to_numpy(dtype=np.float64, copy=False)
     ytr_all = y_train.to_numpy(dtype=np.float64, copy=False)
 
-    # Build + train
-    device = default_device(args.ft_device)
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    model = FTTransformer(
-        n_features=len(cols),
-        d_token=args.ft_d_token,
-        n_blocks=args.ft_n_blocks,
-        n_heads=args.ft_n_heads,
-        d_ffn=args.ft_d_ffn,
-        dropout=args.ft_dropout,
-        attn_dropout=args.ft_attn_dropout,
-    )
+    # XGBoost trees are less scale-sensitive than linear/NN models, but the
+    # c906 presim matrix contains very wide bus-value features (~1e38).  Use
+    # the same train-split z-score preprocessing as the other c906 pipelines
+    # so the booster never sees huge raw magnitudes, and train on standardized
+    # y so early-stopping RMSE is comparable across categories.
+    std = Standardizer.fit(Xtt, ytt)
+    Xtt_z = std.transform_X(Xtt)
+    Xtv_z = std.transform_X(Xtv)
+    Xte_z = std.transform_X(Xte)
+    Xtr_all_z = std.transform_X(Xtr_all)
+    ytt_z = std.transform_y(ytt)
+    ytv_z = std.transform_y(ytv)
+    print("  preprocessing: z-scored selected X and target y before XGBoost")
 
-    n_params = sum(p.numel() for p in model.parameters())
-    amp_active = args.ft_amp and device.type == "cuda"
-    print(f"  fitting FT-Transformer on {describe_device(device)}"
-          f"{' [amp]' if amp_active else ''}  ({n_params/1e6:.2f}M params, "
-          f"d_token={args.ft_d_token}, n_blocks={args.ft_n_blocks}, "
-          f"n_heads={args.ft_n_heads}, d_ffn={args.ft_d_ffn}) ...")
-    print("  preprocessing: z-scored selected X and target y before FT-Transformer")
+    print(f"  fitting XGBRegressor ("
+          f"n_estimators={args.gbdt_n_estimators}, "
+          f"max_depth={args.gbdt_max_depth}, "
+          f"lr={args.gbdt_learning_rate}, "
+          f"tree_method={args.gbdt_tree_method}) ...")
     t_train = time.time()
-    model, history, std = train_ft_transformer(
-        model, Xtt, ytt, Xtv, ytv,
-        lr=args.ft_lr,
-        weight_decay=args.ft_weight_decay,
-        max_epochs=args.ft_max_epochs,
-        patience=args.ft_patience,
-        batch_size=args.ft_batch_size,
-        device=device,
-        input_noise_std=args.ft_input_noise_std,
-        grad_clip=args.ft_grad_clip,
-        seed=args.seed,
-        use_amp=args.ft_amp,
-        verbose=True,
+    model = xgb.XGBRegressor(
+        n_estimators=args.gbdt_n_estimators,
+        max_depth=args.gbdt_max_depth,
+        learning_rate=args.gbdt_learning_rate,
+        subsample=args.gbdt_subsample,
+        colsample_bytree=args.gbdt_colsample_bytree,
+        tree_method=args.gbdt_tree_method,
+        n_jobs=args.gbdt_n_jobs,
+        random_state=args.seed,
+        early_stopping_rounds=args.gbdt_early_stopping_rounds,
+        eval_metric="rmse",
+    )
+    model.fit(
+        Xtt_z, ytt_z,
+        eval_set=[(Xtt_z, ytt_z), (Xtv_z, ytv_z)],
+        verbose=False,
     )
     train_seconds = time.time() - t_train
+    best_iter = int(model.best_iteration) if hasattr(model, "best_iteration") else int(args.gbdt_n_estimators - 1)
+    print(f"  best_iteration = {best_iter}")
 
-    # Predictions on the FULL train set (not just train-train) and test set
-    yp_tr = ft_predict(model, Xtr_all, std, device=device)
-    yp_te = ft_predict(model, Xte, std, device=device)
+    evals_result = model.evals_result()
+    # XGBoost names the two eval sets validation_0 (train) and validation_1 (val).
+    train_curve = evals_result.get("validation_0", {}).get("rmse", [])
+    val_curve = evals_result.get("validation_1", {}).get("rmse", [])
+    history = {
+        "train_loss": list(train_curve),
+        "val_loss": list(val_curve),
+        "best_epoch": best_iter,
+    }
+
+    yp_tr = std.inverse_y(model.predict(Xtr_all_z))
+    yp_te = std.inverse_y(model.predict(Xte_z))
     m_tr = compute_metrics(ytr_all, yp_tr)
     m_te = compute_metrics(yte, yp_te)
     print(f"  train: RMSE={m_tr['rmse']:.5f}  MAPE={m_tr['mape']:.2f}%  "
@@ -262,52 +240,42 @@ def run_one(label, X_train, y_train, X_test, y_test, args, out_dir,
     print(f"  test : RMSE={m_te['rmse']:.5f}  MAPE={m_te['mape']:.2f}%  "
           f"R²={m_te['r2']:.4f}")
 
-    # Attention extraction on the test set
-    cls_attn, ff_attn = extract_attention(model, Xte, std, device=device)
-    feat_scores = pd.Series(cls_attn, index=cols).sort_values(ascending=False)
-    top30 = feat_scores.head(30).index.tolist()
-    top30_idx = [cols.index(f) for f in top30]
-    ff_top30 = ff_attn[np.ix_(top30_idx, top30_idx)]
-    # Zero the diagonal so the heatmap highlights cross-feature attention.
-    np.fill_diagonal(ff_top30, 0.0)
+    importance = np.asarray(model.feature_importances_, dtype=np.float64)
+    feat_scores = pd.Series(importance, index=cols).sort_values(ascending=False)
 
-    # Save artifacts
     label_dir = os.path.join(out_dir, label)
     os.makedirs(label_dir, exist_ok=True)
-    plot_training_curve(history, os.path.join(label_dir, "training_curve.png"))
+    if history["train_loss"] and history["val_loss"]:
+        plot_training_curve(history, os.path.join(label_dir, "training_curve.png"))
     plot_pred_vs_true(yte, yp_te, os.path.join(label_dir, "pred_vs_true.png"),
                       title=f"Predicted vs True ({label}, test)")
     plot_top_features(
-        feat_scores, os.path.join(label_dir, "cls_attention_top30.png"),
-        title=f"Top features ({label}) -- CLS attention",
+        feat_scores, os.path.join(label_dir, "feature_importance_top30.png"),
+        title=f"Top features ({label}) -- XGBoost gain",
     )
-    plot_interaction_heatmap(
-        ff_top30, top30, os.path.join(label_dir, "interaction_heatmap.png"),
-        title=f"Feature-feature attention top-30 ({label})",
-    )
-    feat_scores.to_csv(os.path.join(label_dir, "cls_attention.csv"))
-    pd.DataFrame(ff_top30, index=top30, columns=top30).to_csv(
-        os.path.join(label_dir, "interaction_matrix_top30.csv"))
+    feat_scores.to_csv(os.path.join(label_dir, "feature_importance.csv"))
     pd.DataFrame({"y_true": yte, "y_pred": yp_te}).to_csv(
         os.path.join(label_dir, "test_predictions.csv"), index=False)
-    torch.save({
-        "state_dict": model.state_dict(),
-        "selected_cols": list(cols),
-        "preprocessing": "zscore_selected_X_and_y_before_ft_transformer",
-        "x_mean": std.x_mean,
-        "x_std": std.x_std,
-        "y_mean": std.y_mean,
-        "y_std": std.y_std,
-        "config": {
-            "n_features": len(cols),
-            "d_token": args.ft_d_token,
-            "n_blocks": args.ft_n_blocks,
-            "n_heads": args.ft_n_heads,
-            "d_ffn": args.ft_d_ffn,
-            "dropout": args.ft_dropout,
-            "attn_dropout": args.ft_attn_dropout,
-        },
-    }, os.path.join(label_dir, "model.pt"))
+    with open(os.path.join(label_dir, "model.pkl"), "wb") as f:
+        pickle.dump({
+            "model": model,
+            "selected_cols": list(cols),
+            "preprocessing": "zscore_selected_X_and_y_before_xgboost",
+            "standardizer": {
+                "x_mean": std.x_mean, "x_std": std.x_std,
+                "y_mean": std.y_mean, "y_std": std.y_std,
+            },
+            "best_iteration": best_iter,
+            "config": {
+                "n_estimators": args.gbdt_n_estimators,
+                "max_depth": args.gbdt_max_depth,
+                "learning_rate": args.gbdt_learning_rate,
+                "subsample": args.gbdt_subsample,
+                "colsample_bytree": args.gbdt_colsample_bytree,
+                "tree_method": args.gbdt_tree_method,
+                "early_stopping_rounds": args.gbdt_early_stopping_rounds,
+            },
+        }, f)
 
     print(f"  done in {time.time() - t0:.1f}s")
     return {
@@ -318,9 +286,7 @@ def run_one(label, X_train, y_train, X_test, y_test, args, out_dir,
         "metrics_train": m_tr,
         "metrics_test": m_te,
         "feat_scores": feat_scores,
-        "top30": top30,
-        "ff_top30": ff_top30,
-        "best_epoch": int(history["best_epoch"]),
+        "best_epoch": best_iter,
         "train_seconds": train_seconds,
         "fs_seconds": fs_seconds,
     }
@@ -380,46 +346,23 @@ def driver_time_ordered(args, out_dir):
 def aggregate_global(results, out_dir):
     global_dir = os.path.join(out_dir, "global")
     os.makedirs(global_dir, exist_ok=True)
-    # Sum per-feature CLS attention across folds.
     summed = {}
     for r in results:
         for f, v in r["feat_scores"].items():
             summed[f] = summed.get(f, 0.0) + float(v)
     gs = pd.Series(summed).sort_values(ascending=False)
-    gs.to_csv(os.path.join(global_dir, "cls_attention_summed.csv"))
+    gs.to_csv(os.path.join(global_dir, "feature_importance_summed.csv"))
     plot_top_features(
         gs, os.path.join(global_dir, "top_features.png"), top_n=30,
-        title="Global top features (summed CLS attention across folds)",
+        title="Global top features (summed XGBoost gain across folds)",
     )
-
-    # Sum feature-feature attention across folds, restricted to the
-    # global top-30 features.
-    top30 = gs.head(30).index.tolist()
-    M = np.zeros((30, 30), dtype=np.float64)
-    idx_map = {f: i for i, f in enumerate(top30)}
-    for r in results:
-        local_top30 = r["top30"]
-        local_M = r["ff_top30"]
-        for i_local, f_i in enumerate(local_top30):
-            if f_i not in idx_map:
-                continue
-            for j_local, f_j in enumerate(local_top30):
-                if f_j not in idx_map or i_local == j_local:
-                    continue
-                M[idx_map[f_i], idx_map[f_j]] += local_M[i_local, j_local]
-    plot_interaction_heatmap(
-        M, top30, os.path.join(global_dir, "interaction_heatmap.png"),
-        title="Global feature-feature attention top-30 (summed across folds)",
-    )
-    pd.DataFrame(M, index=top30, columns=top30).to_csv(
-        os.path.join(global_dir, "interaction_matrix_top30.csv"))
     return gs
 
 
-def write_report(args, results, global_scores, out_dir, device):
+def write_report(args, results, global_scores, out_dir):
     path = os.path.join(out_dir, "report.md")
     lines = []
-    lines.append(f"# FT-Transformer on c906-db -- split = `{args.split}`\n")
+    lines.append(f"# XGBoost GBDT on c906-db -- split = `{args.split}`\n")
     lines.append("## Hyperparameters\n")
     lines.append(f"- top_k (features): {args.top_k}"
                  f"{' (ignored; feature selection bypassed)' if args.fs_method == 'none' else ''}")
@@ -430,41 +373,17 @@ def write_report(args, results, global_scores, out_dir, device):
     lines.append(f"- fs_method: {args.fs_method}"
                  f"{' (feature selection bypassed)' if args.fs_method == 'none' else ''}")
     lines.append("- preprocessing: selected X columns and target y are z-scored "
-                 "on the internal train-train split before FT-Transformer; "
+                 "on the internal train-train split before XGBoost; "
                  "predictions are inverse-transformed before metrics/plots")
-    if args.fs_method == "univariate":
-        lines.append(f"- fs_score_func: {args.fs_score_func}")
-    if args.fs_method == "variance":
-        lines.append(f"- fs_variance_threshold: {args.fs_variance_threshold}")
-    if args.fs_method == "rfe":
-        lines.append(f"- fs_rfe_step: {args.fs_rfe_step}")
-    if args.fs_method == "from_model":
-        lines.append(f"- fs_from_model_estimator: {args.fs_from_model_estimator}")
-    if args.fs_method == "sequential":
-        lines.append(f"- fs_sfs_tol: {args.fs_sfs_tol}")
-    if args.fs_method in ("mcp", "deep"):
-        lines.append(f"- fs_mcp_gamma: {args.fs_mcp_gamma}")
-        lines.append(f"- fs_mcp_positive: {args.fs_mcp_positive}")
-        lines.append(f"- fs_mcp_lambda_path_len: {args.fs_mcp_lambda_path_len}")
-    if args.fs_method == "deep":
-        lines.append(f"- fs_deep_v_i_multiplier: {args.fs_deep_v_i_multiplier}")
-        lines.append(f"- fs_deep_max_swap_iters: {args.fs_deep_max_swap_iters}")
-    lines.append(f"- ft_d_token: {args.ft_d_token}")
-    lines.append(f"- ft_n_blocks: {args.ft_n_blocks}")
-    lines.append(f"- ft_n_heads: {args.ft_n_heads}")
-    lines.append(f"- ft_d_ffn: {args.ft_d_ffn}")
-    lines.append(f"- ft_dropout: {args.ft_dropout}")
-    lines.append(f"- ft_attn_dropout: {args.ft_attn_dropout}")
-    lines.append(f"- ft_lr: {args.ft_lr}")
-    lines.append(f"- ft_weight_decay: {args.ft_weight_decay}")
-    lines.append(f"- ft_batch_size: {args.ft_batch_size}")
-    lines.append(f"- ft_max_epochs: {args.ft_max_epochs}")
-    lines.append(f"- ft_patience: {args.ft_patience}")
-    lines.append(f"- ft_val_ratio: {args.ft_val_ratio}")
-    lines.append(f"- ft_input_noise_std: {args.ft_input_noise_std}")
-    lines.append(f"- ft_grad_clip: {args.ft_grad_clip}")
-    lines.append(f"- ft_amp: {args.ft_amp}")
-    lines.append(f"- device_used: {describe_device(device)}")
+    lines.append(f"- gbdt_n_estimators: {args.gbdt_n_estimators}")
+    lines.append(f"- gbdt_max_depth: {args.gbdt_max_depth}")
+    lines.append(f"- gbdt_learning_rate: {args.gbdt_learning_rate}")
+    lines.append(f"- gbdt_subsample: {args.gbdt_subsample}")
+    lines.append(f"- gbdt_colsample_bytree: {args.gbdt_colsample_bytree}")
+    lines.append(f"- gbdt_early_stopping_rounds: {args.gbdt_early_stopping_rounds}")
+    lines.append(f"- gbdt_val_ratio: {args.gbdt_val_ratio}")
+    lines.append(f"- gbdt_tree_method: {args.gbdt_tree_method}")
+    lines.append(f"- gbdt_n_jobs: {args.gbdt_n_jobs}")
     lines.append("")
     lines.append("## Per-fold/category metrics\n")
     lines.append(
@@ -485,19 +404,18 @@ def write_report(args, results, global_scores, out_dir, device):
         )
     lines.append("")
     lines.append("## Top 20 features globally\n")
-    lines.append("| rank | feature | summed CLS attention |")
+    lines.append("| rank | feature | summed gain |")
     lines.append("|---:|---|---:|")
     for i, (name, val) in enumerate(global_scores.head(20).items(), 1):
         lines.append(f"| {i} | `{name}` | {val:.5f} |")
     lines.append("")
     lines.append("## Files\n")
     lines.append("Each fold/category subfolder contains:\n")
-    lines.append("- `training_curve.png` -- train/val MSE on standardized y")
+    lines.append("- `training_curve.png` -- train/val RMSE per boosting round on standardized y")
     lines.append("- `pred_vs_true.png` -- scatter on the test split")
-    lines.append("- `cls_attention_top30.png` -- top-30 features by CLS attention")
-    lines.append("- `interaction_heatmap.png` -- top-30 feature-feature attention")
-    lines.append("- `cls_attention.csv`, `interaction_matrix_top30.csv`, `test_predictions.csv`")
-    lines.append("- `model.pt` -- state_dict + selected cols + standardizer + config")
+    lines.append("- `feature_importance_top30.png` -- top-30 features by gain")
+    lines.append("- `feature_importance.csv`, `test_predictions.csv`")
+    lines.append("- `model.pkl` -- XGBRegressor + selected cols + standardizer + best_iteration + config")
     lines.append("")
     lines.append("`global/` contains the same artifacts aggregated across all folds.")
     with open(path, "w") as f:
@@ -511,7 +429,7 @@ def write_report(args, results, global_scores, out_dir, device):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="FT-Transformer on c906-db power data")
+        description="XGBoost GBDT regression on c906-db power data")
     parser.add_argument("--split", choices=["loco", "time_ordered"], required=True)
     parser.add_argument("--top_k", type=int, default=1000,
                         help="Number of features to keep; ignored when "
@@ -520,7 +438,6 @@ def main():
     parser.add_argument("--test_ratio", type=float, default=0.2,
                         help="Used only when --split time_ordered")
 
-    # Feature-selection knobs (copy of c906_rulefit.py)
     fs_choices = ("none",) + tuple(FeatureSelector.METHODS)
     parser.add_argument(
         "--fs_method", choices=fs_choices, default="pearson",
@@ -545,9 +462,7 @@ def main():
     parser.add_argument("--fs_n_jobs", type=int, default=-1,
                         help="Parallelism for sklearn estimators (LassoCV, RF, "
                              "SFS) and joblib-parallel mutual_info_regression. "
-                             "-1 = all cores. MCP/DEEP coord descent is "
-                             "sequential by algorithm; numba is auto-used if "
-                             "installed.")
+                             "-1 = all cores.")
     parser.add_argument(
         "--presim_subdir", "--presim", dest="presim_subdir",
         type=str, default="presim",
@@ -555,28 +470,17 @@ def main():
              "(e.g. presim, presim_large, presim_no_addr_data).",
     )
 
-    # FT-Transformer hyperparameters
-    parser.add_argument("--ft_d_token", type=int, default=32)
-    parser.add_argument("--ft_n_blocks", type=int, default=3)
-    parser.add_argument("--ft_n_heads", type=int, default=4)
-    parser.add_argument("--ft_d_ffn", type=int, default=64)
-    parser.add_argument("--ft_dropout", type=float, default=0.1)
-    parser.add_argument("--ft_attn_dropout", type=float, default=0.1)
-    parser.add_argument("--ft_lr", type=float, default=1e-3)
-    parser.add_argument("--ft_weight_decay", type=float, default=1e-4)
-    parser.add_argument("--ft_batch_size", type=int, default=256)
-    parser.add_argument("--ft_max_epochs", type=int, default=300)
-    parser.add_argument("--ft_patience", type=int, default=40)
-    parser.add_argument("--ft_val_ratio", type=float, default=0.2,
+    # GBDT-specific
+    parser.add_argument("--gbdt_n_estimators", type=int, default=500)
+    parser.add_argument("--gbdt_max_depth", type=int, default=6)
+    parser.add_argument("--gbdt_learning_rate", type=float, default=0.05)
+    parser.add_argument("--gbdt_subsample", type=float, default=0.8)
+    parser.add_argument("--gbdt_colsample_bytree", type=float, default=0.8)
+    parser.add_argument("--gbdt_early_stopping_rounds", type=int, default=30)
+    parser.add_argument("--gbdt_val_ratio", type=float, default=0.2,
                         help="Fraction of training rows held out for early stopping.")
-    parser.add_argument("--ft_input_noise_std", type=float, default=0.02)
-    parser.add_argument("--ft_grad_clip", type=float, default=1.0)
-    parser.add_argument("--ft_device", choices=["auto", "cpu", "mps", "cuda"], default="auto",
-                        help="auto picks CUDA > MPS > CPU. Explicit cuda/mps "
-                             "raises if unavailable instead of silently falling back.")
-    parser.add_argument("--ft_amp", action="store_true",
-                        help="Mixed-precision (autocast + GradScaler) on CUDA. "
-                             "No-op on MPS / CPU.")
+    parser.add_argument("--gbdt_n_jobs", type=int, default=-1)
+    parser.add_argument("--gbdt_tree_method", type=str, default="hist")
 
     args = parser.parse_args()
     try:
@@ -585,6 +489,8 @@ def main():
         parser.error(str(exc))
     warnings.filterwarnings("ignore", category=FutureWarning)
 
+    np.random.seed(args.seed)
+
     out_suffix = ""
     if args.fs_method != "pearson":
         out_suffix += f"_{args.fs_method}"
@@ -592,20 +498,10 @@ def main():
         out_suffix += f"_{args.presim_subdir}"
     out_dir = os.path.join(
         os.path.dirname(__file__), "..", "..", "output",
-        f"ft_c906_{args.split}{out_suffix}",
+        f"gbdt_c906_{args.split}{out_suffix}",
     )
     os.makedirs(out_dir, exist_ok=True)
     print(f"output dir: {os.path.abspath(out_dir)}")
-
-    # Resolve and announce the training device early so users can verify GPU
-    # is in use before training starts.
-    device = default_device(args.ft_device)
-    print(f"device: {describe_device(device)}"
-          f"{' [amp]' if (args.ft_amp and device.type == 'cuda') else ''}")
-    if args.ft_device == "auto" and device.type == "cpu":
-        print("WARNING: --ft_device auto resolved to CPU (no CUDA or MPS available). "
-              "Training will be slow. Install a GPU-enabled PyTorch build to "
-              "use --ft_device cuda or mps.")
 
     if args.split == "loco":
         results = driver_loco(args, out_dir)
@@ -613,7 +509,7 @@ def main():
         results = driver_time_ordered(args, out_dir)
 
     global_scores = aggregate_global(results, out_dir)
-    write_report(args, results, global_scores, out_dir, device=device)
+    write_report(args, results, global_scores, out_dir)
     print("\nDone.")
 
 
